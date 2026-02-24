@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import threading
 from pathlib import Path
@@ -36,6 +35,7 @@ WORKSPACE = ROOT / "workspace"
 DATASET_DIR = WORKSPACE / "dataset"
 EXPORT_DIR = WORKSPACE / "exports"
 MODEL_DIR = WORKSPACE / "models"
+SPLIT_FILE = DATASET_DIR / "splits.json"
 META_FILE = MODEL_DIR / "metadata.json"
 MODEL_FILE = MODEL_DIR / "classifier.pt"
 ONNX_FILE = EXPORT_DIR / "classifier.onnx"
@@ -57,6 +57,7 @@ class ClassifierGUI(QMainWindow):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.class_names = self._load_existing_classes()
+        self.split_map = self._load_split_map()
         self.model = None
 
         self.transform_train = transforms.Compose([
@@ -94,8 +95,14 @@ class ClassifierGUI(QMainWindow):
         self.add_images_btn.clicked.connect(self.add_images_to_selected_class)
         self.preview_image_btn = QPushButton("선택 이미지 미리보기")
         self.preview_image_btn.clicked.connect(self.preview_selected_dataset_image)
+        self.mark_train_btn = QPushButton("선택 이미지 → 학습용")
+        self.mark_train_btn.clicked.connect(lambda: self.set_selected_image_split("train"))
+        self.mark_eval_btn = QPushButton("선택 이미지 → 평가용")
+        self.mark_eval_btn.clicked.connect(lambda: self.set_selected_image_split("eval"))
         image_btn_row.addWidget(self.add_images_btn)
         image_btn_row.addWidget(self.preview_image_btn)
+        image_btn_row.addWidget(self.mark_train_btn)
+        image_btn_row.addWidget(self.mark_eval_btn)
 
         self.dataset_images = QListWidget()
 
@@ -172,6 +179,24 @@ class ClassifierGUI(QMainWindow):
             return []
         return sorted([d.name for d in DATASET_DIR.iterdir() if d.is_dir()])
 
+    def _load_split_map(self):
+        if not SPLIT_FILE.exists():
+            return {}
+        try:
+            with open(SPLIT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {k: ("eval" if v == "eval" else "train") for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _save_split_map(self):
+        SPLIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SPLIT_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.split_map, f, ensure_ascii=False, indent=2)
+
+    def _key_for_image(self, cls: str, filename: str):
+        return f"{cls}/{filename}"
+
     def refresh_classes(self):
         self.class_names = self._load_existing_classes()
         self.class_list.clear()
@@ -216,6 +241,9 @@ class ClassifierGUI(QMainWindow):
                     idx += 1
                 dst = class_dir / f"{base}_{idx}{ext}"
             shutil.copy2(src, dst)
+            self.split_map[self._key_for_image(cls, dst.name)] = "train"
+
+        self._save_split_map()
 
         self.log_msg(f"{len(files)}개 이미지를 '{cls}' 클래스에 추가")
         self.refresh_dataset_images()
@@ -227,14 +255,36 @@ class ClassifierGUI(QMainWindow):
             return
         for img in sorted((DATASET_DIR / cls).glob("*")):
             if img.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-                self.dataset_images.addItem(QListWidgetItem(str(img.name)))
+                split = self.split_map.get(self._key_for_image(cls, img.name), "train")
+                self.dataset_images.addItem(QListWidgetItem(f"[{split}] {img.name}"))
+
+    def _selected_dataset_filename(self):
+        item = self.dataset_images.currentItem()
+        if item is None:
+            return None
+        text = item.text()
+        if "] " in text:
+            return text.split("] ", 1)[1]
+        return text
+
+    def set_selected_image_split(self, split: str):
+        cls = self.selected_class()
+        filename = self._selected_dataset_filename()
+        if not cls or not filename:
+            QMessageBox.warning(self, "경고", "클래스와 이미지를 먼저 선택하세요.")
+            return
+
+        self.split_map[self._key_for_image(cls, filename)] = split
+        self._save_split_map()
+        self.refresh_dataset_images()
+        self.log_msg(f"{filename} → {split} 설정")
 
     def preview_selected_dataset_image(self):
         cls = self.selected_class()
-        item = self.dataset_images.currentItem()
-        if not cls or not item:
+        filename = self._selected_dataset_filename()
+        if not cls or not filename:
             return
-        img_path = DATASET_DIR / cls / item.text()
+        img_path = DATASET_DIR / cls / filename
         self.show_preview(img_path)
 
     def show_preview(self, img_path: Path):
@@ -250,15 +300,48 @@ class ClassifierGUI(QMainWindow):
         return model.to(self.device)
 
     def create_dataset(self):
-        images = []
-        labels = []
+        train_images = []
+        train_labels = []
+        eval_images = []
+        eval_labels = []
         classes = sorted([d.name for d in DATASET_DIR.iterdir() if d.is_dir()])
         for idx, cls in enumerate(classes):
             for img in (DATASET_DIR / cls).glob("*"):
                 if img.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
-                    images.append(img)
-                    labels.append(idx)
-        return images, labels, classes
+                    split = self.split_map.get(self._key_for_image(cls, img.name), "train")
+                    if split == "eval":
+                        eval_images.append(img)
+                        eval_labels.append(idx)
+                    else:
+                        train_images.append(img)
+                        train_labels.append(idx)
+        return train_images, train_labels, eval_images, eval_labels, classes
+
+    def evaluate_model(self, model, images, labels, batch_size):
+        if not images:
+            return None, None
+
+        model.eval()
+        criterion = nn.CrossEntropyLoss()
+        total_loss = 0.0
+        correct = 0
+        count = 0
+        with torch.no_grad():
+            for start in range(0, len(images), batch_size):
+                batch_imgs = images[start : start + batch_size]
+                batch_labels = labels[start : start + batch_size]
+                x = torch.stack([
+                    self.transform_eval(Image.open(p).convert("RGB")) for p in batch_imgs
+                ]).to(self.device)
+                y = torch.tensor(batch_labels, dtype=torch.long).to(self.device)
+                out = model(x)
+                loss = criterion(out, y)
+                total_loss += loss.item() * len(batch_imgs)
+                pred = out.argmax(dim=1)
+                correct += (pred == y).sum().item()
+                count += len(batch_imgs)
+
+        return total_loss / count, correct / count
 
     def train_model(self):
         try:
@@ -269,17 +352,21 @@ class ClassifierGUI(QMainWindow):
             QMessageBox.warning(self, "오류", "하이퍼파라미터 형식이 잘못되었습니다.")
             return
 
-        images, labels, classes = self.create_dataset()
+        train_images, train_labels, eval_images, eval_labels, classes = self.create_dataset()
         if len(classes) < 2:
             QMessageBox.warning(self, "오류", "최소 2개 클래스가 필요합니다.")
             return
-        if len(images) < max(4, len(classes) * 2):
+        if len(train_images) < max(4, len(classes) * 2):
             QMessageBox.warning(self, "오류", "학습 이미지 수가 너무 적습니다.")
             return
 
         self.progress.setVisible(True)
         self.train_btn.setEnabled(False)
-        self.log_msg(f"학습 시작 - samples={len(images)}, classes={len(classes)}")
+        self.log_msg(
+            f"학습 시작 - train={len(train_images)}, eval={len(eval_images)}, classes={len(classes)}"
+        )
+        if not eval_images:
+            self.log_msg("평가용 이미지가 없어 검증은 생략됩니다. (선택 이미지를 eval로 지정 가능)")
 
         signals = TrainerSignals()
         signals.progress.connect(self.log_msg)
@@ -300,7 +387,7 @@ class ClassifierGUI(QMainWindow):
                 criterion = nn.CrossEntropyLoss()
                 optimizer = optim.Adam(model.parameters(), lr=lr)
 
-                idxs = np.arange(len(images))
+                idxs = np.arange(len(train_images))
                 np.random.shuffle(idxs)
 
                 for epoch in range(epochs):
@@ -314,9 +401,9 @@ class ClassifierGUI(QMainWindow):
                         batch_x = []
                         batch_y = []
                         for i in batch_ids:
-                            img = Image.open(images[i]).convert("RGB")
+                            img = Image.open(train_images[i]).convert("RGB")
                             batch_x.append(self.transform_train(img))
-                            batch_y.append(labels[i])
+                            batch_y.append(train_labels[i])
 
                         x = torch.stack(batch_x).to(self.device)
                         y = torch.tensor(batch_y, dtype=torch.long).to(self.device)
@@ -335,6 +422,12 @@ class ClassifierGUI(QMainWindow):
                     signals.progress.emit(
                         f"Epoch {epoch+1}/{epochs} - loss={total_loss/count:.4f}, acc={correct/count:.4f}"
                     )
+
+                    eval_loss, eval_acc = self.evaluate_model(model, eval_images, eval_labels, batch_size)
+                    if eval_loss is not None:
+                        signals.progress.emit(
+                            f"Epoch {epoch+1}/{epochs} - val_loss={eval_loss:.4f}, val_acc={eval_acc:.4f}"
+                        )
 
                 MODEL_DIR.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), MODEL_FILE)
