@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QGraphicsPixmapItem,
@@ -149,12 +150,16 @@ class ClassifierGUI(QMainWindow):
         image_btn_row.addWidget(self.mark_eval_btn)
 
         self.dataset_images = QListWidget()
+        self.dataset_images.setSelectionMode(QListWidget.ExtendedSelection)
+        self.delete_images_btn = QPushButton("선택 이미지 삭제")
+        self.delete_images_btn.clicked.connect(self.delete_selected_images)
 
         data_layout.addLayout(class_row)
         data_layout.addWidget(QLabel("클래스"))
         data_layout.addWidget(self.class_list)
         data_layout.addWidget(QLabel("선택 클래스 이미지"))
         data_layout.addWidget(self.dataset_images)
+        data_layout.addWidget(self.delete_images_btn)
         data_layout.addLayout(image_btn_row)
 
         train_group = QGroupBox("2) 학습")
@@ -164,12 +169,19 @@ class ClassifierGUI(QMainWindow):
         self.epoch_input = QLineEdit("3")
         self.batch_input = QLineEdit("8")
         self.lr_input = QLineEdit("0.001")
+        self.model_combo = QComboBox()
+        self.model_combo.addItem("ResNet18", "resnet18")
+        self.model_combo.addItem("MobileNetV3 Small", "mobilenet_v3_small")
+        self.model_combo.addItem("EfficientNet B0", "efficientnet_b0")
+        self.model_combo.addItem("ConvNeXt Tiny", "convnext_tiny")
         hp_row.addWidget(QLabel("Epoch"))
         hp_row.addWidget(self.epoch_input)
         hp_row.addWidget(QLabel("Batch"))
         hp_row.addWidget(self.batch_input)
         hp_row.addWidget(QLabel("LR"))
         hp_row.addWidget(self.lr_input)
+        hp_row.addWidget(QLabel("Model"))
+        hp_row.addWidget(self.model_combo)
 
         self.train_btn = QPushButton("학습 시작")
         self.train_btn.clicked.connect(self.train_model)
@@ -313,6 +325,13 @@ class ClassifierGUI(QMainWindow):
             return text.split("] ", 1)[1]
         return text
 
+    def _selected_dataset_filenames(self):
+        files = []
+        for item in self.dataset_images.selectedItems():
+            text = item.text()
+            files.append(text.split("] ", 1)[1] if "] " in text else text)
+        return files
+
     def set_selected_image_split(self, split: str):
         cls = self.selected_class()
         filename = self._selected_dataset_filename()
@@ -324,6 +343,26 @@ class ClassifierGUI(QMainWindow):
         self._save_split_map()
         self.refresh_dataset_images()
         self.log_msg(f"{filename} → {split} 설정")
+
+    def delete_selected_images(self):
+        cls = self.selected_class()
+        filenames = self._selected_dataset_filenames()
+        if not cls or not filenames:
+            QMessageBox.warning(self, "경고", "삭제할 이미지를 선택하세요.")
+            return
+
+        deleted = 0
+        class_dir = DATASET_DIR / cls
+        for name in filenames:
+            path = class_dir / name
+            if path.exists():
+                path.unlink()
+                deleted += 1
+            self.split_map.pop(self._key_for_image(cls, name), None)
+
+        self._save_split_map()
+        self.refresh_dataset_images()
+        self.log_msg(f"{deleted}개 이미지 삭제 완료")
 
     def preview_selected_dataset_image(self):
         cls = self.selected_class()
@@ -338,10 +377,23 @@ class ClassifierGUI(QMainWindow):
         if not ok:
             QMessageBox.warning(self, "오류", "미리보기를 표시할 수 없습니다.")
 
-    def build_model(self, num_classes: int, pretrained: bool = True):
-        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
-        model = models.resnet18(weights=weights)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+    def build_model(self, num_classes: int, pretrained: bool = True, arch: str = "resnet18"):
+        if arch == "mobilenet_v3_small":
+            weights = models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None
+            model = models.mobilenet_v3_small(weights=weights)
+            model.classifier[3] = nn.Linear(model.classifier[3].in_features, num_classes)
+        elif arch == "efficientnet_b0":
+            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
+            model = models.efficientnet_b0(weights=weights)
+            model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+        elif arch == "convnext_tiny":
+            weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+            model = models.convnext_tiny(weights=weights)
+            model.classifier[2] = nn.Linear(model.classifier[2].in_features, num_classes)
+        else:
+            weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+            model = models.resnet18(weights=weights)
+            model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model.to(self.device)
 
     def create_dataset(self):
@@ -453,6 +505,7 @@ class ClassifierGUI(QMainWindow):
             return
 
         train_images, train_labels, eval_images, eval_labels, classes = self.create_dataset()
+        selected_arch = self.model_combo.currentData() or "resnet18"
         if len(classes) < 2:
             QMessageBox.warning(self, "오류", "최소 2개 클래스가 필요합니다.")
             return
@@ -484,12 +537,12 @@ class ClassifierGUI(QMainWindow):
         def worker():
             try:
                 try:
-                    model = self.build_model(len(classes), pretrained=True)
+                    model = self.build_model(len(classes), pretrained=True, arch=selected_arch)
                 except Exception as e:
                     signals.progress.emit(
                         f"사전학습 가중치 다운로드 실패로 랜덤 초기화로 진행합니다: {e}"
                     )
-                    model = self.build_model(len(classes), pretrained=False)
+                    model = self.build_model(len(classes), pretrained=False, arch=selected_arch)
                 criterion = nn.CrossEntropyLoss()
                 optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -538,7 +591,12 @@ class ClassifierGUI(QMainWindow):
                 MODEL_DIR.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), MODEL_FILE)
                 with open(META_FILE, "w", encoding="utf-8") as f:
-                    json.dump({"classes": classes}, f, ensure_ascii=False, indent=2)
+                    json.dump(
+                        {"classes": classes, "arch": selected_arch},
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
 
                 self.model = model.eval()
                 self.class_names = classes
@@ -557,12 +615,17 @@ class ClassifierGUI(QMainWindow):
         with open(META_FILE, "r", encoding="utf-8") as f:
             meta = json.load(f)
         classes = meta["classes"]
-        model = self.build_model(len(classes), pretrained=False)
+        arch = meta.get("arch", "resnet18")
+        model = self.build_model(len(classes), pretrained=False, arch=arch)
         state = torch.load(MODEL_FILE, map_location=self.device)
         model.load_state_dict(state)
         model.eval()
         self.model = model
         self.class_names = classes
+        for i in range(self.model_combo.count()):
+            if self.model_combo.itemData(i) == arch:
+                self.model_combo.setCurrentIndex(i)
+                break
         return True
 
     def run_inference(self):
