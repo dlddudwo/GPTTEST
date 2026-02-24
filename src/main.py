@@ -12,7 +12,11 @@ from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFileDialog,
+    QGraphicsPixmapItem,
+    QGraphicsScene,
+    QGraphicsView,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -25,6 +29,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QTextEdit,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +50,44 @@ ONNX_FILE = EXPORT_DIR / "classifier.onnx"
 class TrainerSignals(QObject):
     progress = Signal(str)
     finished = Signal(bool, str)
+
+
+class ZoomPanImageView(QGraphicsView):
+    def __init__(self):
+        super().__init__()
+        self.setScene(QGraphicsScene(self))
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.scene().addItem(self.pixmap_item)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self._zoom_level = 0
+
+    def set_image(self, path: Path):
+        pixmap = QPixmap(str(path))
+        if pixmap.isNull():
+            return False
+        self.pixmap_item.setPixmap(pixmap)
+        self.scene().setSceneRect(self.pixmap_item.boundingRect())
+        self.resetTransform()
+        self.fitInView(self.pixmap_item, Qt.KeepAspectRatio)
+        self._zoom_level = 0
+        return True
+
+    def wheelEvent(self, event):
+        if self.pixmap_item.pixmap().isNull():
+            return
+        if event.angleDelta().y() > 0:
+            factor = 1.25
+            self._zoom_level += 1
+        else:
+            factor = 0.8
+            self._zoom_level -= 1
+
+        if self._zoom_level < -10:
+            self._zoom_level = -10
+            return
+        self.scale(factor, factor)
 
 
 class ClassifierGUI(QMainWindow):
@@ -149,17 +193,19 @@ class ClassifierGUI(QMainWindow):
         self.infer_btn.clicked.connect(self.run_inference)
         self.result_label = QLabel("예측 결과: (없음)")
 
-        self.image_preview = QLabel("이미지 미리보기")
-        self.image_preview.setAlignment(Qt.AlignCenter)
+        self.image_preview = ZoomPanImageView()
         self.image_preview.setMinimumHeight(280)
         self.image_preview.setStyleSheet("border:1px solid #999;")
 
         self.export_btn = QPushButton("ONNX 내보내기 (C++ 연동용)")
         self.export_btn.clicked.connect(self.export_onnx)
+        self.cm_btn = QPushButton("평가 Confusion Matrix 보기")
+        self.cm_btn.clicked.connect(self.evaluate_eval_set_with_confusion_matrix)
 
         infer_layout.addWidget(self.infer_btn)
         infer_layout.addWidget(self.result_label)
         infer_layout.addWidget(self.image_preview)
+        infer_layout.addWidget(self.cm_btn)
         infer_layout.addWidget(self.export_btn)
 
         layout.addWidget(data_group, 0, 0)
@@ -288,11 +334,9 @@ class ClassifierGUI(QMainWindow):
         self.show_preview(img_path)
 
     def show_preview(self, img_path: Path):
-        pixmap = QPixmap(str(img_path))
-        if pixmap.isNull():
-            self.image_preview.setText("미리보기를 표시할 수 없습니다")
-            return
-        self.image_preview.setPixmap(pixmap.scaled(self.image_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        ok = self.image_preview.set_image(img_path)
+        if not ok:
+            QMessageBox.warning(self, "오류", "미리보기를 표시할 수 없습니다.")
 
     def build_model(self, num_classes: int, pretrained: bool = True):
         weights = models.ResNet18_Weights.DEFAULT if pretrained else None
@@ -343,6 +387,61 @@ class ClassifierGUI(QMainWindow):
                 count += len(batch_imgs)
 
         return total_loss / count, correct / count
+
+    def build_confusion_matrix(self, model, images, labels, num_classes, batch_size):
+        matrix = np.zeros((num_classes, num_classes), dtype=np.int32)
+        model.eval()
+        with torch.no_grad():
+            for start in range(0, len(images), batch_size):
+                batch_imgs = images[start : start + batch_size]
+                batch_labels = labels[start : start + batch_size]
+                x = torch.stack([
+                    self.transform_eval(Image.open(p).convert("RGB")) for p in batch_imgs
+                ]).to(self.device)
+                out = model(x)
+                preds = out.argmax(dim=1).cpu().numpy()
+                for gt, pred in zip(batch_labels, preds):
+                    matrix[int(gt), int(pred)] += 1
+        return matrix
+
+    def show_confusion_matrix_dialog(self, matrix, classes):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Confusion Matrix (Eval)")
+        layout = QVBoxLayout(dialog)
+
+        table = QTableWidget(len(classes), len(classes))
+        table.setHorizontalHeaderLabels(classes)
+        table.setVerticalHeaderLabels(classes)
+        for r in range(len(classes)):
+            for c in range(len(classes)):
+                table.setItem(r, c, QTableWidgetItem(str(int(matrix[r, c]))))
+
+        layout.addWidget(QLabel("행(세로)=정답, 열(가로)=예측"))
+        layout.addWidget(table)
+        dialog.resize(560, 460)
+        dialog.exec()
+
+    def evaluate_eval_set_with_confusion_matrix(self):
+        if not self.load_trained_model():
+            QMessageBox.warning(self, "오류", "먼저 모델을 학습하세요.")
+            return
+
+        _, _, eval_images, eval_labels, classes = self.create_dataset()
+        if not eval_images:
+            QMessageBox.warning(self, "오류", "평가용(eval) 이미지가 없습니다.")
+            return
+
+        try:
+            batch_size = max(1, int(self.batch_input.text().strip() or "8"))
+        except ValueError:
+            batch_size = 8
+
+        matrix = self.build_confusion_matrix(self.model, eval_images, eval_labels, len(classes), batch_size)
+        total = int(matrix.sum())
+        correct = int(np.trace(matrix))
+        acc = (correct / total) if total else 0.0
+        self.log_msg(f"Eval confusion matrix 계산 완료 - samples={total}, acc={acc:.4f}")
+        self.show_confusion_matrix_dialog(matrix, classes)
 
     def train_model(self):
         try:
