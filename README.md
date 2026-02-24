@@ -35,9 +35,11 @@ python src/main.py
 5. Epoch/Batch/LR + **Model 콤보박스(ResNet18/MobileNetV3/EfficientNet/ConvNeXt)** 선택 후 학습
    (평가용 이미지가 있으면 에폭별 검증 로그 출력)
 6. 오른쪽 미리보기에서 **마우스 휠 확대/축소 + 드래그 이동**으로 이미지 자세히 확인
-7. 학습 후 **평가 Confusion Matrix 보기** 버튼으로 eval 기준 confusion matrix 확인
-8. **테스트 이미지로 예측**
-9. **ONNX 내보내기** 버튼으로 C++ 연동 파일 생성
+7. **Heatmap 보기 체크박스**를 켜고 예측하면 모델 중요영역(heatmap) 오버레이 확인
+8. 학습 후 **평가 Confusion Matrix 보기** 버튼으로 eval 기준 confusion matrix 확인
+9. **테스트 이미지로 예측** (학습 모델이 없으면 선택한 백본의 사전학습 모델로 판정)
+10. 데이터셋 목록에서 여러 이미지를 선택한 뒤 **선택 이미지 판정(학습 없이 가능)** 으로 일괄 판정
+11. **ONNX 내보내기** 버튼으로 C++ 연동 파일 생성
 
 ## 4) 출력 파일
 

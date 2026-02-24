@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt, Signal, QObject
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -104,6 +106,7 @@ class ClassifierGUI(QMainWindow):
         self.class_names = self._load_existing_classes()
         self.split_map = self._load_split_map()
         self.model = None
+        self.active_arch = None
 
         self.transform_train = transforms.Compose([
             transforms.Resize((224, 224)),
@@ -153,6 +156,8 @@ class ClassifierGUI(QMainWindow):
         self.dataset_images.setSelectionMode(QListWidget.ExtendedSelection)
         self.delete_images_btn = QPushButton("선택 이미지 삭제")
         self.delete_images_btn.clicked.connect(self.delete_selected_images)
+        self.classify_selected_btn = QPushButton("선택 이미지 판정(학습 없이 가능)")
+        self.classify_selected_btn.clicked.connect(self.classify_selected_images)
 
         data_layout.addLayout(class_row)
         data_layout.addWidget(QLabel("클래스"))
@@ -160,6 +165,7 @@ class ClassifierGUI(QMainWindow):
         data_layout.addWidget(QLabel("선택 클래스 이미지"))
         data_layout.addWidget(self.dataset_images)
         data_layout.addWidget(self.delete_images_btn)
+        data_layout.addWidget(self.classify_selected_btn)
         data_layout.addLayout(image_btn_row)
 
         train_group = QGroupBox("2) 학습")
@@ -204,6 +210,7 @@ class ClassifierGUI(QMainWindow):
         self.infer_btn = QPushButton("테스트 이미지로 예측")
         self.infer_btn.clicked.connect(self.run_inference)
         self.result_label = QLabel("예측 결과: (없음)")
+        self.heatmap_check = QCheckBox("Heatmap 보기 (모델 중요영역)")
 
         self.image_preview = ZoomPanImageView()
         self.image_preview.setMinimumHeight(280)
@@ -216,6 +223,7 @@ class ClassifierGUI(QMainWindow):
 
         infer_layout.addWidget(self.infer_btn)
         infer_layout.addWidget(self.result_label)
+        infer_layout.addWidget(self.heatmap_check)
         infer_layout.addWidget(self.image_preview)
         infer_layout.addWidget(self.cm_btn)
         infer_layout.addWidget(self.export_btn)
@@ -395,6 +403,128 @@ class ClassifierGUI(QMainWindow):
             model = models.resnet18(weights=weights)
             model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model.to(self.device)
+
+    def get_pretrained_categories(self, arch: str):
+        try:
+            if arch == "mobilenet_v3_small":
+                return list(models.MobileNet_V3_Small_Weights.DEFAULT.meta.get("categories", []))
+            if arch == "efficientnet_b0":
+                return list(models.EfficientNet_B0_Weights.DEFAULT.meta.get("categories", []))
+            if arch == "convnext_tiny":
+                return list(models.ConvNeXt_Tiny_Weights.DEFAULT.meta.get("categories", []))
+            return list(models.ResNet18_Weights.DEFAULT.meta.get("categories", []))
+        except Exception:
+            return []
+
+    def ensure_prediction_model(self):
+        if self.load_trained_model():
+            return True
+
+        arch = self.model_combo.currentData() or "resnet18"
+        try:
+            self.model = self.build_model(1000, pretrained=True, arch=arch).eval()
+            self.class_names = self.get_pretrained_categories(arch)
+            self.active_arch = arch
+            self.log_msg(f"학습 모델이 없어 {arch} 사전학습 모델로 판정합니다.")
+            return True
+        except Exception as e:
+            QMessageBox.critical(self, "실패", f"사전학습 모델 로드 실패: {e}")
+            return False
+
+    def predict_image(self, image_path: Path):
+        img = Image.open(image_path).convert("RGB")
+        x = self.transform_eval(img).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self.model(x)
+            prob = torch.softmax(out, dim=1)[0]
+            idx = int(torch.argmax(prob).item())
+            score = float(prob[idx].item())
+
+        if self.class_names and idx < len(self.class_names):
+            label = self.class_names[idx]
+        else:
+            label = f"class_{idx}"
+        return label, score, idx
+
+    def get_target_layer(self, arch: str):
+        if arch == "mobilenet_v3_small":
+            return self.model.features[-1]
+        if arch == "efficientnet_b0":
+            return self.model.features[-1]
+        if arch == "convnext_tiny":
+            return self.model.features[-1]
+        return self.model.layer4[-1]
+
+    def build_heatmap_overlay(self, image_path: Path, class_idx: int):
+        arch = self.active_arch or (self.model_combo.currentData() or "resnet18")
+        target_layer = self.get_target_layer(arch)
+        activations = []
+        gradients = []
+
+        def fwd_hook(_, __, output):
+            activations.append(output)
+
+        def bwd_hook(_, grad_input, grad_output):
+            gradients.append(grad_output[0])
+
+        h1 = target_layer.register_forward_hook(fwd_hook)
+        h2 = target_layer.register_full_backward_hook(bwd_hook)
+        try:
+            img = Image.open(image_path).convert("RGB")
+            x = self.transform_eval(img).unsqueeze(0).to(self.device)
+            self.model.zero_grad()
+            out = self.model(x)
+            score = out[0, class_idx]
+            score.backward()
+
+            if not activations or not gradients:
+                return None
+            act = activations[0][0]
+            grad = gradients[0][0]
+            weights = grad.mean(dim=(1, 2), keepdim=True)
+            cam = torch.relu((weights * act).sum(dim=0)).detach().cpu().numpy()
+            if cam.max() > 0:
+                cam = cam / cam.max()
+
+            base = np.array(img.resize((224, 224))).astype(np.float32)
+            heat = np.uint8(cam * 255)
+            heat_rgb = np.zeros((224, 224, 3), dtype=np.float32)
+            heat_rgb[:, :, 0] = heat
+            overlay = np.clip(0.55 * base + 0.45 * heat_rgb, 0, 255).astype(np.uint8)
+            out_path = EXPORT_DIR / "heatmap_preview.png"
+            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(overlay).save(out_path)
+            return out_path
+        finally:
+            h1.remove()
+            h2.remove()
+
+    def show_batch_result_dialog(self, rows):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("선택 이미지 판정 결과")
+        layout = QVBoxLayout(dialog)
+        view = QTextBrowser()
+        lines = [f"- {name}: {label} ({score:.2%})" for name, label, score in rows]
+        view.setText("\n".join(lines))
+        layout.addWidget(view)
+        dialog.resize(640, 440)
+        dialog.exec()
+
+    def classify_selected_images(self):
+        cls = self.selected_class()
+        files = self._selected_dataset_filenames()
+        if not cls or not files:
+            QMessageBox.warning(self, "경고", "판정할 이미지를 선택하세요.")
+            return
+        if not self.ensure_prediction_model():
+            return
+
+        rows = []
+        for name in files:
+            path = DATASET_DIR / cls / name
+            label, score, _ = self.predict_image(path)
+            rows.append((name, label, score))
+        self.show_batch_result_dialog(rows)
 
     def create_dataset(self):
         train_images = []
@@ -600,6 +730,7 @@ class ClassifierGUI(QMainWindow):
 
                 self.model = model.eval()
                 self.class_names = classes
+                self.active_arch = selected_arch
                 signals.finished.emit(True, f"학습 완료. 모델 저장: {MODEL_FILE}")
             except Exception as e:
                 signals.finished.emit(False, str(e))
@@ -622,6 +753,7 @@ class ClassifierGUI(QMainWindow):
         model.eval()
         self.model = model
         self.class_names = classes
+        self.active_arch = arch
         for i in range(self.model_combo.count()):
             if self.model_combo.itemData(i) == arch:
                 self.model_combo.setCurrentIndex(i)
@@ -629,8 +761,7 @@ class ClassifierGUI(QMainWindow):
         return True
 
     def run_inference(self):
-        if not self.load_trained_model():
-            QMessageBox.warning(self, "오류", "먼저 모델을 학습하세요.")
+        if not self.ensure_prediction_model():
             return
 
         file, _ = QFileDialog.getOpenFileName(self, "테스트 이미지 선택", str(ROOT), "Images (*.png *.jpg *.jpeg *.bmp)")
@@ -640,16 +771,13 @@ class ClassifierGUI(QMainWindow):
         path = Path(file)
         self.show_preview(path)
 
-        img = Image.open(path).convert("RGB")
-        x = self.transform_eval(img).unsqueeze(0).to(self.device)
+        label, score, idx = self.predict_image(path)
+        self.result_label.setText(f"예측 결과: {label} ({score:.2%})")
 
-        with torch.no_grad():
-            out = self.model(x)
-            prob = torch.softmax(out, dim=1)[0]
-            idx = int(torch.argmax(prob).item())
-            score = float(prob[idx].item())
-
-        self.result_label.setText(f"예측 결과: {self.class_names[idx]} ({score:.2%})")
+        if self.heatmap_check.isChecked():
+            heatmap_path = self.build_heatmap_overlay(path, idx)
+            if heatmap_path is not None:
+                self.show_preview(heatmap_path)
 
     def export_onnx(self):
         if not self.load_trained_model():
