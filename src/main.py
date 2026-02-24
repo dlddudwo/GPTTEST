@@ -294,8 +294,9 @@ class ClassifierGUI(QMainWindow):
             return
         self.image_preview.setPixmap(pixmap.scaled(self.image_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-    def build_model(self, num_classes: int):
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    def build_model(self, num_classes: int, pretrained: bool = True):
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        model = models.resnet18(weights=weights)
         model.fc = nn.Linear(model.fc.in_features, num_classes)
         return model.to(self.device)
 
@@ -383,7 +384,13 @@ class ClassifierGUI(QMainWindow):
 
         def worker():
             try:
-                model = self.build_model(len(classes))
+                try:
+                    model = self.build_model(len(classes), pretrained=True)
+                except Exception as e:
+                    signals.progress.emit(
+                        f"사전학습 가중치 다운로드 실패로 랜덤 초기화로 진행합니다: {e}"
+                    )
+                    model = self.build_model(len(classes), pretrained=False)
                 criterion = nn.CrossEntropyLoss()
                 optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -451,7 +458,7 @@ class ClassifierGUI(QMainWindow):
         with open(META_FILE, "r", encoding="utf-8") as f:
             meta = json.load(f)
         classes = meta["classes"]
-        model = self.build_model(len(classes))
+        model = self.build_model(len(classes), pretrained=False)
         state = torch.load(MODEL_FILE, map_location=self.device)
         model.load_state_dict(state)
         model.eval()
