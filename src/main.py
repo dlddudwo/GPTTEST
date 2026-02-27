@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTableWidget,
     QTableWidgetItem,
-    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
@@ -159,8 +158,6 @@ class ClassifierGUI(QMainWindow):
         self.dataset_images.setSelectionMode(QListWidget.ExtendedSelection)
         self.delete_images_btn = QPushButton("선택 이미지 삭제")
         self.delete_images_btn.clicked.connect(self.delete_selected_images)
-        self.classify_selected_btn = QPushButton("선택 이미지 판정(학습 없이 가능)")
-        self.classify_selected_btn.clicked.connect(self.classify_selected_images)
 
         data_layout.addLayout(class_row)
         data_layout.addWidget(QLabel("클래스"))
@@ -168,7 +165,6 @@ class ClassifierGUI(QMainWindow):
         data_layout.addWidget(QLabel("선택 클래스 이미지"))
         data_layout.addWidget(self.dataset_images)
         data_layout.addWidget(self.delete_images_btn)
-        data_layout.addWidget(self.classify_selected_btn)
         data_layout.addLayout(image_btn_row)
 
         train_group = QGroupBox("2) 학습")
@@ -364,15 +360,16 @@ class ClassifierGUI(QMainWindow):
 
     def set_selected_image_split(self, split: str):
         cls = self.selected_class()
-        filename = self._selected_dataset_filename()
-        if not cls or not filename:
+        filenames = self._selected_dataset_filenames()
+        if not cls or not filenames:
             QMessageBox.warning(self, "경고", "클래스와 이미지를 먼저 선택하세요.")
             return
 
-        self.split_map[self._key_for_image(cls, filename)] = split
+        for filename in filenames:
+            self.split_map[self._key_for_image(cls, filename)] = split
         self._save_split_map()
         self.refresh_dataset_images()
-        self.log_msg(f"{filename} → {split} 설정")
+        self.log_msg(f"{len(filenames)}개 이미지 → {split} 설정")
 
     def delete_selected_images(self):
         cls = self.selected_class()
@@ -405,11 +402,9 @@ class ClassifierGUI(QMainWindow):
         self.show_preview(img_path)
 
         split = self.split_map.get(self._key_for_image(cls, filename), "train")
-        if split == "eval" and self.load_trained_model():
+        if self.load_trained_model():
             pred_label, pred_score, pred_idx = self.predict_image(img_path)
-            self.result_label.setText(
-                f"예측 결과: {pred_label} ({pred_score:.2%}) / GT={cls} [eval]"
-            )
+            self.result_label.setText(f"예측 결과: {pred_label} ({pred_score:.2%}) / GT={cls} [{split}]")
             if self.heatmap_check.isChecked():
                 heatmap_path = self.build_heatmap_overlay(img_path, pred_idx)
                 if heatmap_path is not None:
@@ -505,33 +500,6 @@ class ClassifierGUI(QMainWindow):
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
         Image.fromarray(overlay).save(out_path)
         return out_path
-
-    def show_batch_result_dialog(self, rows):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("선택 이미지 판정 결과")
-        layout = QVBoxLayout(dialog)
-        view = QTextBrowser()
-        lines = [f"- {name}: {label} ({score:.2%})" for name, label, score in rows]
-        view.setText("\n".join(lines))
-        layout.addWidget(view)
-        dialog.resize(640, 440)
-        dialog.exec()
-
-    def classify_selected_images(self):
-        cls = self.selected_class()
-        files = self._selected_dataset_filenames()
-        if not cls or not files:
-            QMessageBox.warning(self, "경고", "판정할 이미지를 선택하세요.")
-            return
-        if not self.ensure_prediction_model():
-            return
-
-        rows = []
-        for name in files:
-            path = DATASET_DIR / cls / name
-            label, score, _ = self.predict_image(path)
-            rows.append((name, label, score))
-        self.show_batch_result_dialog(rows)
 
     def create_dataset(self):
         train_images = []
