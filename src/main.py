@@ -133,8 +133,11 @@ class ClassifierGUI(QMainWindow):
         self.class_input.setPlaceholderText("새 클래스 이름 (예: cat)")
         self.add_class_btn = QPushButton("클래스 추가")
         self.add_class_btn.clicked.connect(self.add_class)
+        self.delete_class_btn = QPushButton("선택 클래스 삭제")
+        self.delete_class_btn.clicked.connect(self.delete_selected_class)
         class_row.addWidget(self.class_input)
         class_row.addWidget(self.add_class_btn)
+        class_row.addWidget(self.delete_class_btn)
 
         self.class_list = QListWidget()
 
@@ -281,6 +284,25 @@ class ClassifierGUI(QMainWindow):
         self.refresh_classes()
         self.log_msg(f"클래스 추가: {name}")
 
+    def delete_selected_class(self):
+        cls = self.selected_class()
+        if not cls:
+            QMessageBox.warning(self, "경고", "삭제할 클래스를 선택하세요.")
+            return
+
+        class_dir = DATASET_DIR / cls
+        if class_dir.exists():
+            shutil.rmtree(class_dir)
+
+        prefix = f"{cls}/"
+        self.split_map = {k: v for k, v in self.split_map.items() if not k.startswith(prefix)}
+        self._save_split_map()
+        self.dataset_images.clear()
+        self.image_preview.pixmap_item.setPixmap(QPixmap())
+        self.result_label.setText("예측 결과: (없음)")
+        self.refresh_classes()
+        self.log_msg(f"클래스 삭제: {cls}")
+
     def selected_class(self):
         item = self.class_list.currentItem()
         if item is None:
@@ -378,7 +400,20 @@ class ClassifierGUI(QMainWindow):
         if not cls or not filename:
             return
         img_path = DATASET_DIR / cls / filename
+        if not img_path.exists():
+            return
         self.show_preview(img_path)
+
+        split = self.split_map.get(self._key_for_image(cls, filename), "train")
+        if split == "eval" and self.load_trained_model():
+            pred_label, pred_score, pred_idx = self.predict_image(img_path)
+            self.result_label.setText(
+                f"예측 결과: {pred_label} ({pred_score:.2%}) / GT={cls} [eval]"
+            )
+            if self.heatmap_check.isChecked():
+                heatmap_path = self.build_heatmap_overlay(img_path, pred_idx)
+                if heatmap_path is not None:
+                    self.show_preview(heatmap_path)
 
     def show_preview(self, img_path: Path):
         ok = self.image_preview.set_image(img_path)
@@ -446,58 +481,30 @@ class ClassifierGUI(QMainWindow):
             label = f"class_{idx}"
         return label, score, idx
 
-    def get_target_layer(self, arch: str):
-        if arch == "mobilenet_v3_small":
-            return self.model.features[-1]
-        if arch == "efficientnet_b0":
-            return self.model.features[-1]
-        if arch == "convnext_tiny":
-            return self.model.features[-1]
-        return self.model.layer4[-1]
-
     def build_heatmap_overlay(self, image_path: Path, class_idx: int):
-        arch = self.active_arch or (self.model_combo.currentData() or "resnet18")
-        target_layer = self.get_target_layer(arch)
-        activations = []
-        gradients = []
+        img = Image.open(image_path).convert("RGB")
+        x = self.transform_eval(img).unsqueeze(0).to(self.device)
+        x.requires_grad_(True)
 
-        def fwd_hook(_, __, output):
-            activations.append(output)
+        self.model.zero_grad()
+        out = self.model(x)
+        score = out[0, class_idx]
+        score.backward()
 
-        def bwd_hook(_, grad_input, grad_output):
-            gradients.append(grad_output[0])
+        grad = x.grad[0].detach().cpu().numpy()
+        saliency = np.max(np.abs(grad), axis=0)
+        if saliency.max() > 0:
+            saliency = saliency / saliency.max()
 
-        h1 = target_layer.register_forward_hook(fwd_hook)
-        h2 = target_layer.register_full_backward_hook(bwd_hook)
-        try:
-            img = Image.open(image_path).convert("RGB")
-            x = self.transform_eval(img).unsqueeze(0).to(self.device)
-            self.model.zero_grad()
-            out = self.model(x)
-            score = out[0, class_idx]
-            score.backward()
-
-            if not activations or not gradients:
-                return None
-            act = activations[0][0]
-            grad = gradients[0][0]
-            weights = grad.mean(dim=(1, 2), keepdim=True)
-            cam = torch.relu((weights * act).sum(dim=0)).detach().cpu().numpy()
-            if cam.max() > 0:
-                cam = cam / cam.max()
-
-            base = np.array(img.resize((224, 224))).astype(np.float32)
-            heat = np.uint8(cam * 255)
-            heat_rgb = np.zeros((224, 224, 3), dtype=np.float32)
-            heat_rgb[:, :, 0] = heat
-            overlay = np.clip(0.55 * base + 0.45 * heat_rgb, 0, 255).astype(np.uint8)
-            out_path = EXPORT_DIR / "heatmap_preview.png"
-            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-            Image.fromarray(overlay).save(out_path)
-            return out_path
-        finally:
-            h1.remove()
-            h2.remove()
+        base = np.array(img.resize((224, 224))).astype(np.float32)
+        heat = np.uint8(saliency * 255)
+        heat_rgb = np.zeros((224, 224, 3), dtype=np.float32)
+        heat_rgb[:, :, 0] = heat
+        overlay = np.clip(0.55 * base + 0.45 * heat_rgb, 0, 255).astype(np.uint8)
+        out_path = EXPORT_DIR / "heatmap_preview.png"
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(overlay).save(out_path)
+        return out_path
 
     def show_batch_result_dialog(self, rows):
         dialog = QDialog(self)
